@@ -6,9 +6,9 @@
       <div class="roi-row">
         <span>ROI #{{ i+1 }}</span>
         <el-input v-model="roi.label" size="small" placeholder="标签" style="width:80px"/>
-        <el-input-number v-model="roi.center[0]" size="small" :min="0" :max="63" style="width:65px" controls-position="right"/>
-        <el-input-number v-model="roi.center[1]" size="small" :min="0" :max="63" style="width:65px" controls-position="right"/>
-        <el-input-number v-model="roi.center[2]" size="small" :min="0" :max="63" style="width:65px" controls-position="right"/>
+        <el-input-number v-model="roi.center[0]" size="small" :min="0" :max="dimX" style="width:65px" controls-position="right"/>
+        <el-input-number v-model="roi.center[1]" size="small" :min="0" :max="dimY" style="width:65px" controls-position="right"/>
+        <el-input-number v-model="roi.center[2]" size="small" :min="0" :max="dimZ" style="width:65px" controls-position="right"/>
         <el-input-number v-model="roi.radius" size="small" :min="2" :max="20" style="width:60px" controls-position="right"/>
         <el-button size="small" type="danger" @click="removeROI(i)" circle>×</el-button>
       </div>
@@ -31,18 +31,28 @@
 </template>
 
 <script setup lang="ts">
-import { ref } from 'vue'
+import { computed } from 'vue'
 import { useImagingStore } from '../store/imaging'
+import type { ROIDef } from '@/types'
 const store = useImagingStore()
 
-interface ROIDef { label: string; center: number[]; radius: number }
-const rois = ref<ROIDef[]>([
-  { label: 'lesion1', center: [30, 28, 32], radius: 6 }
-])
+// dimensions 为 [depth, height, width]
+const dimX = computed(() => (store.volumeData?.dimensions[2] ?? 64) - 1)
+const dimY = computed(() => (store.volumeData?.dimensions[1] ?? 64) - 1)
+const dimZ = computed(() => (store.volumeData?.dimensions[0] ?? 64) - 1)
 
-function addROI() { rois.value.push({ label: `roi-${rois.value.length+1}`, center: [32, 32, 32], radius: 8 }) }
+// ROI 定义按份保留：切组/切份后仍是该份自己的配置
+const rois = computed<ROIDef[]>(() => store.roiDefs)
+
+function addROI() {
+  rois.value.push({
+    label: `roi-${rois.value.length+1}`,
+    center: [Math.round(dimX.value / 2), Math.round(dimY.value / 2), Math.round(dimZ.value / 2)],
+    radius: 8,
+  })
+}
 function removeROI(i: number) { rois.value.splice(i, 1) }
-function analyze() { store.analyzeROI(rois.value.map(r => ({...r}))) }
+function analyze() { store.analyzeROI(rois.value.map(r => ({ ...r, center: [...r.center] }))) }
 </script>
 
 <style scoped>

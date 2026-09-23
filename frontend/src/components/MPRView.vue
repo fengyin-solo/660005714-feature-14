@@ -1,19 +1,24 @@
 <template>
   <canvas ref="cvs" width="160" height="160" class="mpr-canvas"></canvas>
-  <input type="range" class="slider" :min="0" :max="maxSlice" v-model="slice" @input="draw"/>
+  <input type="range" class="slider" :min="0" :max="maxSlice" v-model.number="slice" @input="draw"/>
 </template>
 
 <script setup lang="ts">
 import { ref, watch, computed, onMounted } from 'vue'
 import { useImagingStore } from '../store/imaging'
-const props = defineProps<{ plane: string }>()
+const props = defineProps<{ plane: 'axial' | 'coronal' | 'sagittal' }>()
 const store = useImagingStore()
 const cvs = ref<HTMLCanvasElement>()
-const slice = ref(32)
 
 const maxSlice = computed(() => {
   const dims = store.volumeData?.dimensions || [64, 64, 64]
   return props.plane === 'axial' ? dims[0]-1 : props.plane === 'coronal' ? dims[1]-1 : dims[2]-1
+})
+
+// 切片位置按"当前聚焦的一份"逐份保留，切组/切份后回到各自上次的位置
+const slice = computed<number>({
+  get: () => store.mprSlice[props.plane],
+  set: v => { store.mprSlice[props.plane] = v },
 })
 
 function draw() {

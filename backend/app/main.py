@@ -1,6 +1,7 @@
 import random, math
+from typing import Optional
 import numpy as np
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -13,6 +14,17 @@ class VolumeRequest(BaseModel):
     width: int = 64
     height: int = 64
     depth: int = 64
+    # 用于模拟损坏材料：truncated=数据截断, header=文件头损坏
+    corrupt: Optional[str] = None
+
+
+# 单份影像允许的体素尺寸范围（任一维度）
+MAX_DIMENSION = 512
+
+CORRUPT_REASONS = {
+    "truncated": "材料损坏：像素数据被截断，体素数量与文件头声明的尺寸不一致，解析中止。",
+    "header": "材料损坏：文件头缺少必需标签（Rows / Columns / PixelData），无法确定影像尺寸。",
+}
 
 
 class ROIRequest(BaseModel):
@@ -109,6 +121,21 @@ def generate_volume(preset: str, w: int, h: int, d: int):
 
 @app.post("/api/volume")
 def get_volume(req: VolumeRequest):
+    # 损坏材料：仅这一份失败，调用方据此单独标记
+    if req.corrupt in CORRUPT_REASONS:
+        raise HTTPException(status_code=422, detail=CORRUPT_REASONS[req.corrupt])
+
+    # 检查类型不受支持
+    if req.preset not in ("brain", "chest", "abdomen"):
+        raise HTTPException(status_code=400, detail=f"不支持的检查类型「{req.preset}」，仅支持 brain/chest/abdomen 预设。")
+
+    # 尺寸异常：单维度越界或非正值，属于该份材料自身的问题
+    for name, val in (("宽", req.width), ("高", req.height), ("深", req.depth)):
+        if val <= 0:
+            raise HTTPException(status_code=400, detail=f"尺寸异常：{name}度为 {val}，必须为正整数。")
+        if val > MAX_DIMENSION:
+            raise HTTPException(status_code=400, detail=f"尺寸异常：{name}度为 {val}，超过单维度上限 {MAX_DIMENSION}，可能为导出错误。")
+
     vol = generate_volume(req.preset, req.width, req.height, req.depth)
 
     # Extract mid slices for MPR
