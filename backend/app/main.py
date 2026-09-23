@@ -176,3 +176,111 @@ def analyze_roi(req: ROIAnalyzeRequest):
 @app.get("/api/windows")
 def get_windows():
     return {"presets": WINDOW_PRESETS}
+
+
+# ---------------------------------------------------------------------------
+# 检查(study)目录与批量成组载入
+#
+# 一份检查对应一份影像材料；批量载入时按份返回 ok / warning / error，
+# 任何一份损坏或尺寸异常都不影响同组其它材料。
+# ---------------------------------------------------------------------------
+
+# 模拟 PACS 中的检查登记信息（corrupt/size 异常仅用于演示按份隔离）
+STUDY_CATALOG = {
+    "CT-HEAD-0001":  {"patient_name": "张建国", "modality": "CT", "body_part": "头颅",   "study_date": "2026-09-20", "preset": "brain",   "size": (48, 48, 48)},
+    "CT-HEAD-0002":  {"patient_name": "李文秀", "modality": "CT", "body_part": "头颅",   "study_date": "2026-09-21", "preset": "brain",   "size": (48, 48, 48)},
+    "CT-CHEST-0001": {"patient_name": "王海涛", "modality": "CT", "body_part": "胸部",   "study_date": "2026-09-21", "preset": "chest",   "size": (48, 48, 48)},
+    "CT-CHEST-0002": {"patient_name": "赵敏",   "modality": "CT", "body_part": "胸部",   "study_date": "2026-09-22", "preset": "chest",   "size": (48, 48, 10)},  # 层数异常
+    "CT-ABDO-0001":  {"patient_name": "陈德发", "modality": "CT", "body_part": "腹部",   "study_date": "2026-09-22", "preset": "abdomen", "size": (48, 48, 48)},
+    "CT-ABDO-0002":  {"patient_name": "刘桂芳", "modality": "CT", "body_part": "腹部",   "study_date": "2026-09-23", "preset": "abdomen", "size": (48, 48, 48)},
+    "MR-LSPINE-007": {"patient_name": "孙立军", "modality": "MR", "body_part": "腰椎",   "study_date": "2026-09-19", "preset": "brain",   "size": (48, 48, 48), "corrupt": "header"},
+    "CT-LEGACY-014": {"patient_name": "周慧敏", "modality": "CT", "body_part": "全腹部", "study_date": "2026-08-30", "preset": "abdomen", "size": (48, 48, 48), "corrupt": "truncated"},
+}
+
+CORRUPT_REASONS = {
+    "header":    ("file_corrupt",   "影像材料损坏：DICOM 文件头校验失败（Transfer Syntax 无法识别），文件可能在归档或传输过程中损坏"),
+    "truncated": ("frames_missing", "影像材料损坏：像素数据不完整，声明 48 层实际仅读到 31 层，后续帧丢失"),
+}
+
+
+def build_volume_payload(preset: str, w: int, h: int, d: int):
+    # 复用既有体数据生成器（返回 d×h×w 的嵌套 list），组内多份用小尺寸即可
+    vol = generate_volume(preset, w, h, d)
+    mid_axial, mid_coronal, mid_sagittal = d // 2, h // 2, w // 2
+    return {
+        "volume": vol,
+        "dimensions": [d, h, w],
+        "mpr": {
+            "axial": vol[mid_axial],
+            "coronal": [[vol[z][mid_coronal][x] for x in range(w)] for z in range(d)],
+            "sagittal": [[vol[z][y][mid_sagittal] for y in range(h)] for z in range(d)],
+        },
+        "preset": preset,
+        "windowPresets": WINDOW_PRESETS,
+    }
+
+
+@app.get("/api/studies")
+def list_studies():
+    """可成组打开的检查目录（材料是否完好需载入时才知道）"""
+    return {"studies": [
+        {
+            "studyId": sid,
+            "patientName": spec["patient_name"],
+            "modality": spec["modality"],
+            "bodyPart": spec["body_part"],
+            "studyDate": spec["study_date"],
+        }
+        for sid, spec in STUDY_CATALOG.items()
+    ]}
+
+
+class StudyLoadItem(BaseModel):
+    studyId: str
+
+
+class StudyLoadRequest(BaseModel):
+    items: list[StudyLoadItem] = []
+
+
+def _load_one_study(item: StudyLoadItem) -> dict:
+    """载入单份检查，任何异常都收敛为该份的 error，不波及同组其它份"""
+    sid = item.studyId
+    spec = STUDY_CATALOG.get(sid)
+    if spec is None:
+        return {"studyId": sid, "status": "error",
+                "error": {"code": "not_found",
+                          "message": f"未在 PACS 中找到该检查（{sid}），可能已被归档或删除"},
+                "warnings": [], "volumeData": None}
+
+    corrupt = spec.get("corrupt")
+    if corrupt:
+        code, message = CORRUPT_REASONS[corrupt]
+        return {"studyId": sid, "status": "error",
+                "error": {"code": code, "message": message},
+                "warnings": [], "volumeData": None}
+
+    try:
+        w, h, d = spec["size"]
+        payload = build_volume_payload(spec["preset"], w, h, d)
+    except Exception as exc:  # 解析/重建失败只归这一份
+        return {"studyId": sid, "status": "error",
+                "error": {"code": "decode_failed", "message": f"影像解码失败：{exc}"},
+                "warnings": [], "volumeData": None}
+
+    warnings = []
+    if d < 16:
+        warnings.append(f"影像尺寸异常：Z 轴仅 {d} 层（常规约 48 层），疑似采集中断或重建不完整")
+    if w != h:
+        warnings.append(f"影像尺寸异常：面内尺寸 {w}×{h} 非正方形，重建比例可能失真")
+
+    return {"studyId": sid,
+            "status": "warning" if warnings else "ok",
+            "error": None, "warnings": warnings,
+            "volumeData": payload}
+
+
+@app.post("/api/studies/load")
+def load_studies(req: StudyLoadRequest):
+    # 逐份独立处理：结果顺序与请求顺序一一对应
+    return {"results": [_load_one_study(item) for item in req.items]}

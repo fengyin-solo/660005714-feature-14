@@ -69,7 +69,7 @@ function renderVolume() {
 
 function animate() { animId = requestAnimationFrame(animate); controls.update(); renderer.render(scene, camera) }
 
-onMounted(() => { initScene(); animate() })
+onMounted(() => { initScene(); renderVolume(); animate() })
 watch(() => [store.volumeData, store.windowVal, store.levelVal], renderVolume, { deep: true })
 onUnmounted(() => { cancelAnimationFrame(animId); renderer?.dispose() })
 </script>
